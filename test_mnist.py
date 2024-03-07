@@ -91,7 +91,8 @@ while 1:
 		total+=1
 		if (out & train_data['target'][x]) > 0:
 			partial+=1
-		if out==train_data['target'][x]:
+		if (out^train_data['target'][x]) == 0:
 			correct+=1
+		print('guess',bin(out),'target',bin(train_data['target'][x]))
 	print(correct,'% Correct,',partial,'% Partially Correct')
 

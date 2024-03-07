@@ -3,6 +3,23 @@ from math import floor
 
 seed_zero = random_state(0)
 
+#takes three integers, returns the 3-bit majority of each bit
+#used for training
+def maj3(a,b,c):
+ #any 2 bits set to 1 = 1 out.
+ return (a & b) | (b & c) | (a & c)
+
+#takes a map of wrong positions, and updates the mask and inverse to move accordingly
+#if mask was on (enable), and it was right, do nothing to mask or inv
+#if mask was off (disable), and it was right, turn mask on
+#if mask was on and it was wrong, turn off mask
+#if mask was off and it was wrong, flip inv
+def wrong2maskinv(wrong,mask,inv):
+ inv_out = inv ^ (wrong ^ (~mask))
+ mask_out = mask ^ (wrong & mask)
+ mask_out = mask_out ^ ((~wrong) & (~mask))
+ return mask_out, inv_out
+
 #convert to/from gray coding (symmetric)
 def to_gray(x):
 	return x ^ (x>>mpz(1))
@@ -27,9 +44,9 @@ def forward_nocount(state,mask,inv):
 	return mpz((state & mask)^inv)
 
 #process one layer forward, returning an int
-def forward_layer(state, masks, invs, thresholds):
+def forward_layer(state, masks, invs, threshold):
 	return mpz(sum(
-		[forward(state, masks[x], invs[x], thresholds[x]) << x for x in range(len(masks))]
+		[forward(state, masks[x], invs[x], threshold) << x for x in range(len(masks))]
 	))
 
 # reverse a node, given:
@@ -66,42 +83,18 @@ def reverse(ideal, state, mask, inv, threshold, s_in, seed=seed_zero):
 
 	#create change bits for the mask and inv parameters of wrong outputs
 	#by creating changes, we can tune the change amount by repeatedly &ing with more randoms.
-	mask_change = wrong & mpz_random(seed,mpz(1) << wrong.bit_length())
-	inv_change = wrong & mpz_random(seed,mpz(1) << wrong.bit_length())
+	#mask_change = wrong & (mpz_random(seed,mpz(1) << wrong.bit_length()))
+	#inv_change = wrong & (mpz_random(seed,mpz(1) << wrong.bit_length()))
 
 	#-1 if actual and ideal agree, 0 if they don't
-	agree = (-1 if (actual>threshold)==ideal else 0)
+	#agree = (-1 if (actual>threshold)==ideal else 0)
 
-	threshold_out = threshold
-	threshold_out += -1 if (agree==0) and (actual<threshold) else 0
-	threshold_out += 1 if (agree==0) and (actual>threshold) else 0
-	#threshold_out = threshold + (1 if actual > threshold else (0 if actual == threshold else -1))
-	threshold_out = max(min(threshold_out,s_in),0)
+	mask_out, inv_out = wrong2maskinv(wrong,mask,inv)
 
-	#worked this out with some k-maps.
-	#mask_out = inv ^ agree
-	#inv_out = ~(inv | mask | agree) | (inv & ~agree) | (inv & mask & agree)
+	#mask_out = (mask ^ mask_change) % (1 << s_in)
+	#inv_out = (inv ^ inv_change) % (1 << s_in)
 
-	#changes from initial to output
-	#mask_diff = (mask ^ mask_out)
-	#inv_diff = (inv ^ inv_out)
-
-	#random fuzzing - disable changes randomly - applied thrice for 12.5% activation
-	#mask_rand = mpz_random(seed,mpz(1) << mask_diff.bit_length())
-	#mask_rand &= mpz_random(seed,mpz(1) << mask_diff.bit_length())
-	#mask_rand &= mpz_random(seed,mpz(1) << mask_diff.bit_length())
-	#inv_rand = mpz_random(seed,mpz(1) << inv_diff.bit_length())
-	#inv_rand &= mpz_random(seed,mpz(1) << inv_diff.bit_length())
-	#inv_rand &= mpz_random(seed,mpz(1) << inv_diff.bit_length())
-
-	#apply changes with random and-mask (reduces alterations to ~50%)
-	#mask_out = (mask ^ (mask_diff & mask_rand)) % (1 << s_in)
-	#inv_out = (inv ^ (inv_diff & inv_rand)) % (1 << s_in)
-	mask_out = (mask ^ mask_change) % (1 << s_in)
-	inv_out = (inv ^ inv_change) % (1 << s_in)
-
-	#-agree because the -1 above is "all 1s, all agree" but we work with a single 0/1 in the layer
-	return mask_out, inv_out, threshold_out, wrong
+	return mask_out,inv_out,wrong
 
 #take a list [mpz,mpz,mpz] of a specified size(bits) s_in
 #return a list [mpz,mpz...] of length s_in such that
@@ -118,38 +111,46 @@ def rotate_mpz_list(l,s_in):
 #still a single state, because each layer takes the same state in
 #(fully convolutional)
 #def reverse_layer(ideals, state, masks, invs, thresholds,s_in):
-def reverse_layer(ideals, state, masks, invs, thresholds,s_in):
+def reverse_layer(ideals, state, masks, invs, threshold,s_in):
 	masks_out = masks
 	invs_out = invs
-	thresholds_out = thresholds
-	#ideals_out = ideals
+	ideals_out = mpz(0)
 	wrongs = masks_out
 	for x in range(len(masks)):
-		masks_out[x],invs_out[x],thresholds_out[x],wrongs[x] = reverse(
-			ideals >> x,state,masks[x],invs[x],thresholds[x],s_in
+		masks_out[x],invs_out[x],wrongs[x] = reverse(
+			ideals >> x,state,masks[x],invs[x],threshold,s_in
 		)
 		#ideals_out = (ideals_out << 1) + agree
+
+	#take majority wrongness opinion to construct backprop ideal
+	wrongs_by_input = rotate_mpz_list(wrongs,s_in)
+	for x,w in enumerate(wrongs_by_input):
+		#output is:
+		#majority wrongness as true/false (right/wrong)
+		#XOR with output state
+		ideals_out = (ideals_out << 1) + mpz( (w.bit_count() <= (s_in//2)) ^ state >> x)
+
 	#agree if it's wrong less than half the time, per input
 	#count totals
-	counts = [0]*s_in
-	for x in wrongs:
-		idx = 0
-		while x > 0:
-			if x%2==1:
-				counts[idx]+=1
-			x>>=2
+	#counts = [0]*s_in
+	#for x in wrongs:
+	#	idx = 0
+	#	while x > 0:
+	#		if x%2==1:
+	#			counts[idx]+=1
+	#		x>>=2
 	#convert the list of counts into an mpz of average correctness-es
 	#wrong_maj = sum([mpz(x > s_in//2) << i for i,x in enumerate(counts)])
-	wrong_maj = sum([mpz(0) if (x<s_in//2) else mpz(0).bit_set(i) for i,x in enumerate(counts)])
+	#wrong_maj = sum([mpz(0) if (x<s_in//2) else mpz(0).bit_set(i) for i,x in enumerate(counts)])
 
 	#disagrees = [x.bit_count() > (s_in//2) for x in rotate_mpz_list(wrongs,s_in)]
 	#disagrees = rotate_mpz_list(disagrees,1)[0]
 	#actuals = [x.bit_count() > (s_in//2) for x in rotate_mpz_list(precounts)]
 
 	#given the state fed in and the wrongs fed back, calculate the backprop ideals
-	ideals_out = wrong_maj ^ state
+	#ideals_out = wrong_maj ^ state
 
-	return masks_out,invs_out,thresholds_out,ideals_out
+	return masks_out,invs_out,ideals_out
 	#[mask_out, inv_out, threshold_out] = reverse(ideal, state, mask, inv, threshold)
 
 #take several inputs (must all be ints, castable to mpz) and packs
@@ -195,26 +196,27 @@ def unpack_outputs(packed,unpack):
 
 	return out
 
-
+from gmpy2 import random_state,mpz_random
+seed=random_state(0)
 class Layer:
 	def __init__(self,s_in,s_out,name=''):
 		self.s_in = s_in
 		self.s_out = s_out
 		self.name = name
-		self.masks = [mpz(0)]*s_out
-		self.invs = [mpz(0)]*s_out
-		self.thresholds = [mpz(0)]*s_out
+		self.masks = [mpz_random(seed,2<<s_in) for x in range(s_out)]
+		self.invs = [mpz_random(seed,2<<s_in) for x in range(s_out)]
+		self.threshold = s_in//2
 
 	def __repr__(self):
 		return "<Popnet Layer '"+self.name+"' with "+str(self.width)+" nodes>"
 
 	#run a layer forward and return the output state it generates
 	def forward(self,state):
-		return forward_layer(state,self.masks,self.invs,self.thresholds)
+		return forward_layer(state,self.masks,self.invs,self.threshold)
 
 	#run a layer backprop and return the ideal for the previous layer
 	def reverse(self,ideal,state):
-		self.masks,self.invs,self.thresholds,ideal_out = reverse_layer(
-			ideal,state,self.masks,self.invs,self.thresholds,self.s_in )
+		self.masks,self.invs,ideal_out = reverse_layer(
+			ideal,state,self.masks,self.invs,self.threshold,self.s_in )
 		return ideal_out
 
