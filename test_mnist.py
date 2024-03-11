@@ -1,4 +1,4 @@
-from popnet import *
+from popnet_new import *
 
 
 #training data
